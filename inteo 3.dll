@@ -1,0 +1,390 @@
+// ============================================================
+// GTA V AIMBOT — Standalone DLL (.asi compatible)
+// Click izquierdo → apunta al objetivo más cercano al crosshair
+// F12  → activar / desactivar
+// F11  → descargar DLL
+// Compilar:
+// cl /LD /O2 /EHsc aimbot.cpp /link gdiplus.lib user32.lib gdi32.lib kernel32.lib
+// Renombrar salida: aimbot.dll → aimbot.asi
+// ============================================================
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <gdiplus.h>
+#include <cmath>
+#include <vector>
+#include <thread>
+#include <atomic>
+#include <string>
+#include <unordered_map>
+#include <deque>
+#include <mutex>
+
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "user32.lib")
+
+using namespace Gdiplus;
+
+// ============================================================
+// OFFSETS — GTA V build 2845
+// ============================================================
+#define OFF_LOCAL_PED    0x8
+#define OFF_PED_HEALTH   0x280
+#define OFF_VIEW_MATRIX  0x1883368
+#define OFF_CAMERA_POS   0x1F4
+#define OFF_PED_POOL_PTR 0x17CF3E0
+#define OFF_PED_POOL_CNT 0x110
+#define PED_POOL_STRIDE  0x10
+
+// ============================================================
+// ESTADO GLOBAL
+// ============================================================
+static uintptr_t         g_base      = 0;
+static float             g_fov       = 40.0f;   // FOV en grados
+static float             g_smooth    = 0.10f;   // 0.0 = instantáneo, 1.0 = lento
+static std::atomic<bool> g_running(true);
+static std::atomic<bool> g_aimbotOn(true);
+static HWND              g_overlay   = nullptr;
+static ULONG_PTR         g_gdipToken = 0;
+
+// ============================================================
+// NOTIFICACIONES
+// ============================================================
+struct Notif {
+    std::wstring text;
+    DWORD        born;
+    bool         isOn;
+};
+
+static std::deque<Notif> g_notifs;
+static std::mutex        g_notifMtx;
+
+void PushNotif(const std::wstring& text, bool isOn) {
+    std::lock_guard<std::mutex> lk(g_notifMtx);
+    if (g_notifs.size() >= 3) g_notifs.pop_front();
+    g_notifs.push_back({ text, GetTickCount(), isOn });
+}
+
+// ============================================================
+// MEMORY
+// ============================================================
+uintptr_t GetBase() {
+    if (!g_base) {
+        HMODULE h = GetModuleHandleA("GTA5.exe");
+        if (h) g_base = (uintptr_t)h;
+    }
+    return g_base;
+}
+
+template<typename T>
+T Rd(uintptr_t addr) {
+    __try { return *(T*)addr; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return T{}; }
+}
+
+// ============================================================
+// ESTRUCTURAS
+// ============================================================
+struct Vec3 {
+    float x, y, z;
+    float Dist(const Vec3& o) const {
+        return sqrtf((x-o.x)*(x-o.x)+(y-o.y)*(y-o.y)+(z-o.z)*(z-o.z));
+    }
+};
+
+struct Matrix4x4 { float m[4][4]; };
+
+struct NpcEntry {
+    Vec3  pos;
+    float health;
+    float dist;
+};
+
+// ============================================================
+// WORLD TO SCREEN
+// ============================================================
+bool W2S(const Vec3& w, float& sx, float& sy) {
+    Matrix4x4 vm = Rd<Matrix4x4>(GetBase() + OFF_VIEW_MATRIX);
+    float ww = vm.m[0][3]*w.x + vm.m[1][3]*w.y +
+               vm.m[2][3]*w.z + vm.m[3][3];
+    if (ww < 0.001f) return false;
+    float x = vm.m[0][0]*w.x + vm.m[1][0]*w.y +
+              vm.m[2][0]*w.z + vm.m[3][0];
+    float y = vm.m[0][1]*w.x + vm.m[1][1]*w.y +
+              vm.m[2][1]*w.z + vm.m[3][1];
+    int W = GetSystemMetrics(SM_CXSCREEN);
+    int H = GetSystemMetrics(SM_CYSCREEN);
+    sx = (W / 2.f) * (1.f + x / ww);
+    sy = (H / 2.f) * (1.f - y / ww);
+    return true;
+}
+
+// ============================================================
+// NPC SCANNER
+// ============================================================
+std::vector<NpcEntry> ScanNPCs(const Vec3& cam) {
+    std::vector<NpcEntry> list;
+    uintptr_t base     = GetBase();
+    uintptr_t poolPtr  = Rd<uintptr_t>(base + OFF_PED_POOL_PTR);
+    if (!poolPtr) return list;
+    int count          = min(Rd<int>(poolPtr + OFF_PED_POOL_CNT), 128);
+    uintptr_t localPed = Rd<uintptr_t>(base + OFF_LOCAL_PED);
+    for (int i = 0; i < count; i++) {
+        uintptr_t entry = Rd<uintptr_t>(poolPtr + 0x20 + i * PED_POOL_STRIDE);
+        if (!entry || entry == localPed) continue;
+        float hp = Rd<float>(entry + OFF_PED_HEALTH);
+        if (hp <= 0.f) continue;
+        Vec3 pos = Rd<Vec3>(entry + 0x90);
+        list.push_back({ pos, hp, cam.Dist(pos) });
+    }
+    return list;
+}
+
+// ============================================================
+// AIMBOT TICK — solo actúa con LMB presionado
+// ============================================================
+void AimbotTick() {
+    if (!g_aimbotOn) return;
+    if (!(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) return;
+
+    int   W  = GetSystemMetrics(SM_CXSCREEN);
+    int   H  = GetSystemMetrics(SM_CYSCREEN);
+    float cx = W / 2.f;
+    float cy = H / 2.f;
+
+    Vec3 cam  = Rd<Vec3>(GetBase() + OFF_CAMERA_POS);
+    auto npcs = ScanNPCs(cam);
+
+    NpcEntry* best  = nullptr;
+    float     bestD = 1e9f;
+    float     fovPx = tanf(g_fov * 3.14159f / 180.f) * (W / 2.f);
+
+    for (auto& npc : npcs) {
+        // apunta a la cabeza
+        Vec3  head = { npc.pos.x, npc.pos.y, npc.pos.z + 0.7f };
+        float sx, sy;
+        if (!W2S(head, sx, sy)) continue;
+        float d = sqrtf((sx-cx)*(sx-cx)+(sy-cy)*(sy-cy));
+        if (d < fovPx && d < bestD) {
+            bestD = d;
+            best  = &npc;
+        }
+    }
+
+    if (!best) return;
+
+    Vec3  head = { best->pos.x, best->pos.y, best->pos.z + 0.7f };
+    float sx, sy;
+    if (!W2S(head, sx, sy)) return;
+
+    int mx = (int)((sx - cx) * g_smooth);
+    int my = (int)((sy - cy) * g_smooth);
+    if (abs(mx) > 0 || abs(my) > 0)
+        mouse_event(MOUSEEVENTF_MOVE, (DWORD)mx, (DWORD)my, 0, 0);
+}
+
+// ============================================================
+// OVERLAY — indicador de estado + notificaciones
+// ============================================================
+void DrawOverlay(Graphics& gfx, int W, int H) {
+    FontFamily ff(L"Consolas");
+
+    // Indicador esquina superior derecha
+    Font        stFont(&ff, 13, FontStyleBold, UnitPixel);
+    std::wstring stTxt = g_aimbotOn ? L"[AIMBOT ON]" : L"[AIMBOT OFF]";
+    Color        stCol = g_aimbotOn
+        ? Color(255, 50, 230, 90)
+        : Color(255, 230, 60, 60);
+    SolidBrush stBrush(stCol);
+
+    // Fondo pequeño detrás del indicador
+    SolidBrush bgBrush(Color(160, 8, 8, 14));
+    gfx.FillRectangle(&bgBrush, (float)(W - 148), 10.f, 138.f, 24.f);
+    gfx.DrawString(stTxt.c_str(), -1, &stFont,
+        PointF((float)(W - 144), 13.f), &stBrush);
+
+    // FOV indicator
+    Font       fovFont(&ff, 10, FontStyleRegular, UnitPixel);
+    SolidBrush fovBrush(Color(140, 150, 220, 180));
+    wchar_t    fovStr[32];
+    swprintf_s(fovStr, L"FOV: %.0f", g_fov);
+    gfx.DrawString(fovStr, -1, &fovFont,
+        PointF((float)(W - 144), 36.f), &fovBrush);
+
+    // Notificaciones — esquina inferior derecha
+    std::lock_guard<std::mutex> lk(g_notifMtx);
+    DWORD now = GetTickCount();
+
+    while (!g_notifs.empty()) {
+        if (now - g_notifs.front().born > 2500)
+            g_notifs.pop_front();
+        else break;
+    }
+
+    Font nFont(&ff, 12, FontStyleBold, UnitPixel);
+    int  idx = 0;
+    for (auto& n : g_notifs) {
+        DWORD el    = now - n.born;
+        float alpha = 1.f;
+        if (el < 150)       alpha = el / 150.f;
+        else if (el > 2000) alpha = 1.f - (float)(el - 2000) / 500.f;
+        alpha = max(0.f, min(1.f, alpha));
+        BYTE a = (BYTE)(alpha * 255);
+
+        float nx = W - 258.f;
+        float ny = H - 52.f - idx * 40.f;
+
+        SolidBrush nb(Color((BYTE)(a*0.85f), 8, 8, 14));
+        gfx.FillRectangle(&nb, nx, ny, 240.f, 32.f);
+
+        Color nc = n.isOn
+            ? Color(a, 50, 230, 90)
+            : Color(a, 230, 60, 60);
+        Pen np(nc, 1.5f);
+        gfx.DrawRectangle(&np, nx, ny, 240.f, 32.f);
+
+        SolidBrush nb2(nc);
+        gfx.FillRectangle(&nb2, nx, ny, 3.f, 32.f);
+
+        SolidBrush ntxt(Color(a, 210, 255, 235));
+        std::wstring pfx = n.isOn ? L"[+] " : L"[-] ";
+        gfx.DrawString((pfx + n.text).c_str(), -1, &nFont,
+            PointF(nx + 10, ny + 8), &ntxt);
+        idx++;
+    }
+}
+
+// ============================================================
+// RENDER LOOP
+// ============================================================
+void RenderLoop() {
+    int W = GetSystemMetrics(SM_CXSCREEN);
+    int H = GetSystemMetrics(SM_CYSCREEN);
+
+    while (g_running) {
+        if (!g_overlay) { Sleep(10); continue; }
+
+        HDC hdc = GetDC(g_overlay);
+        if (!hdc) { Sleep(10); continue; }
+
+        HDC     memDC = CreateCompatibleDC(hdc);
+        HBITMAP bmp   = CreateCompatibleBitmap(hdc, W, H);
+        SelectObject(memDC, bmp);
+
+        RECT    rc  = { 0, 0, W, H };
+        HBRUSH  clr = CreateSolidBrush(RGB(0, 0, 0));
+        FillRect(memDC, &rc, clr);
+        DeleteObject(clr);
+
+        {
+            Graphics gfx(memDC);
+            gfx.SetSmoothingMode(SmoothingModeAntiAlias);
+            gfx.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+            DrawOverlay(gfx, W, H);
+        }
+
+        POINT ptSrc = { 0, 0 };
+        SIZE  szWin = { W, H };
+        POINT ptDst = { 0, 0 };
+        BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        UpdateLayeredWindow(g_overlay, hdc, &ptDst, &szWin,
+            memDC, &ptSrc, RGB(0,0,0), &bf, ULW_COLORKEY);
+
+        DeleteObject(bmp);
+        DeleteDC(memDC);
+        ReleaseDC(g_overlay, hdc);
+        Sleep(8);
+    }
+}
+
+// ============================================================
+// CREAR OVERLAY
+// ============================================================
+void CreateOverlay() {
+    int W = GetSystemMetrics(SM_CXSCREEN);
+    int H = GetSystemMetrics(SM_CYSCREEN);
+
+    WNDCLASSEXW wc  = {};
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = DefWindowProcW;
+    wc.hInstance     = GetModuleHandleA(nullptr);
+    wc.lpszClassName = L"GTAAimbot";
+    RegisterClassExW(&wc);
+
+    g_overlay = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_LAYERED |
+        WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+        L"GTAAimbot", L"",
+        WS_POPUP,
+        0, 0, W, H,
+        nullptr, nullptr, wc.hInstance, nullptr);
+
+    SetLayeredWindowAttributes(g_overlay, RGB(0,0,0), 0, LWA_COLORKEY);
+    ShowWindow(g_overlay, SW_SHOW);
+}
+
+// ============================================================
+// HOTKEY LOOP
+// ============================================================
+void HotkeyLoop() {
+    auto Pressed = [](int vk) -> bool {
+        static std::unordered_map<int,bool> prev;
+        bool cur   = (GetAsyncKeyState(vk) & 0x8000) != 0;
+        bool fired = cur && !prev[vk];
+        prev[vk]   = cur;
+        return fired;
+    };
+
+    while (g_running) {
+
+        // F12 — toggle aimbot
+        if (Pressed(VK_F12)) {
+            g_aimbotOn = !g_aimbotOn;
+            PushNotif(
+                g_aimbotOn ? L"Aimbot activado" : L"Aimbot desactivado",
+                g_aimbotOn.load());
+        }
+
+        // F3 / F4 — FOV
+        if (Pressed(VK_F3) && g_fov > 5.f) {
+            g_fov -= 5.f;
+            wchar_t buf[32];
+            swprintf_s(buf, L"FOV: %.0f deg", g_fov);
+            PushNotif(buf, false);
+        }
+        if (Pressed(VK_F4) && g_fov < 150.f) {
+            g_fov += 5.f;
+            wchar_t buf[32];
+            swprintf_s(buf, L"FOV: %.0f deg", g_fov);
+            PushNotif(buf, true);
+        }
+
+        // F11 — unload
+        if (Pressed(VK_F11)) g_running = false;
+
+        // Aimbot tick — solo si LMB presionado
+        AimbotTick();
+
+        Sleep(8);
+    }
+}
+
+// ============================================================
+// DllMain
+// ============================================================
+BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hMod);
+        std::thread([]() {
+            GdiplusStartupInput gsi;
+            GdiplusStartup(&g_gdipToken, &gsi, nullptr);
+            CreateOverlay();
+            std::thread(RenderLoop).detach();
+            HotkeyLoop();
+            if (g_overlay) DestroyWindow(g_overlay);
+            GdiplusShutdown(g_gdipToken);
+        }).detach();
+    }
+    return TRUE;
+}
