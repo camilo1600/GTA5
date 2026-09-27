@@ -1,0 +1,329 @@
+-- FiveM Aimbot GUI | F11 Toggle Panel | Client Script
+
+local enabled = false
+local guiOpen = true
+local targetPed = nil
+local FOV = 25.0
+local SMOOTHING = 0.08
+local BONE = 12844
+
+-- ══════════════════════════════════
+--         UTILITY
+-- ══════════════════════════════════
+
+local function getCamFwd()
+    local rot = GetGameplayCamRot(2)
+    local rx = math.rad(rot.x)
+    local rz = math.rad(rot.z)
+    return vector3(
+        -math.sin(rz) * math.abs(math.cos(rx)),
+         math.cos(rz) * math.abs(math.cos(rx)),
+         math.sin(rx)
+    )
+end
+
+local function angleBetween(camPos, camFwd, targetPos)
+    local toTarget = targetPos - camPos
+    local len = #toTarget
+    if len == 0 then return 999 end
+    toTarget = toTarget / len
+    local dot = math.max(-1.0, math.min(1.0,
+        camFwd.x * toTarget.x + camFwd.y * toTarget.y + camFwd.z * toTarget.z
+    ))
+    return math.deg(math.acos(dot))
+end
+
+local function lerpAngle(a, b, t)
+    return a + (b - a) * t
+end
+
+-- ══════════════════════════════════
+--         TARGET SELECTION
+-- ══════════════════════════════════
+
+local function getBestTarget()
+    local playerPed = PlayerPedId()
+    local camPos = GetGameplayCamCoord()
+    local camFwd = getCamFwd()
+    local bestPed, bestAngle = nil, FOV
+
+    for _, ped in ipairs(GetGamePool('CPed')) do
+        if ped ~= playerPed and IsEntityAlive(ped) and not IsEntityDead(ped) then
+            local boneCoord = GetPedBoneCoords(ped, BONE, 0.0, 0.0, 0.0)
+            local angle = angleBetween(camPos, camFwd, boneCoord)
+            local hasLOS = HasEntityClearLosToEntity(playerPed, ped, 17)
+            if angle < bestAngle and hasLOS then
+                bestAngle = angle
+                bestPed = ped
+            end
+        end
+    end
+    return bestPed
+end
+
+-- ══════════════════════════════════
+--         AIM LOGIC
+-- ══════════════════════════════════
+
+local function aimAtPed(ped)
+    if not DoesEntityExist(ped) or IsEntityDead(ped) then
+        targetPed = nil
+        return
+    end
+    local boneCoord = GetPedBoneCoords(ped, BONE, 0.0, 0.0, 0.0)
+    local camPos = GetGameplayCamCoord()
+    local dx = boneCoord.x - camPos.x
+    local dy = boneCoord.y - camPos.y
+    local dz = boneCoord.z - camPos.z
+    local dist2D = math.sqrt(dx * dx + dy * dy)
+    local pitchTarget = math.deg(math.atan(dz, dist2D))
+    local yawTarget   = math.deg(math.atan(-dx, dy))
+    local currentRot  = GetGameplayCamRot(2)
+    local newPitch = lerpAngle(currentRot.x, pitchTarget, SMOOTHING)
+    local newYaw   = lerpAngle(currentRot.z, yawTarget,   SMOOTHING)
+    SetGameplayCamRelativeRotation(newPitch, 0.0, newYaw)
+end
+
+-- ══════════════════════════════════
+--         MAIN LOOP
+-- ══════════════════════════════════
+
+Citizen.CreateThread(function()
+    while true do
+        Citizen.Wait(0)
+        if enabled then
+            targetPed = getBestTarget()
+            if targetPed then aimAtPed(targetPed) end
+        end
+    end
+end)
+
+-- ══════════════════════════════════
+--            GUI
+-- ══════════════════════════════════
+
+local screenW, screenH = GetActiveScreenResolution()
+
+-- Posición inicial de la tablet (draggable manual)
+local tabX = (screenW / 2) - 140
+local tabY = (screenH / 2) - 130
+local tabW = 280
+local tabH = 260
+local dragging = false
+local dragOffX, dragOffY = 0, 0
+
+-- Slider state
+local sliderDragging = false
+-- FOV range: 5 → 90
+local FOV_MIN, FOV_MAX = 5.0, 90.0
+
+local function drawBox(x, y, w, h, r, g, b, a)
+    DrawRect(x / screenW + (w / screenW) / 2, y / screenH + (h / screenH) / 2,
+             w / screenW, h / screenH, r, g, b, a)
+end
+
+local function drawText(text, x, y, scale, r, g, b, a, center)
+    SetTextFont(4)
+    SetTextScale(scale, scale)
+    SetTextColour(r, g, b, a)
+    if center then SetTextJustification(0) end
+    SetTextEntry("STRING")
+    AddTextComponentString(text)
+    DrawText(x / screenW, y / screenH)
+end
+
+local function isHovered(x, y, w, h)
+    local mx, my = GetControlNormal(0, 239), GetControlNormal(0, 240)
+    mx, my = mx * screenW, my * screenH
+    return mx >= x and mx <= x + w and my >= y and my <= y + h
+end
+
+-- ══════════════════════════════════
+--         GUI DRAW LOOP
+-- ══════════════════════════════════
+
+Citizen.CreateThread(function()
+    while true do
+        Citizen.Wait(0)
+        screenW, screenH = GetActiveScreenResolution()
+
+        if not guiOpen then goto skipDraw end
+
+        -- Dragging tablet
+        if dragging then
+            local mx = GetControlNormal(0, 239) * screenW
+            local my = GetControlNormal(0, 240) * screenH
+            tabX = mx - dragOffX
+            tabY = my - dragOffY
+        end
+
+        -- Fondo tablet
+        drawBox(tabX, tabY, tabW, tabH, 15, 15, 20, 230)
+
+        -- Borde azul
+        drawBox(tabX,          tabY,          tabW, 2,    80, 80, 255, 255)
+        drawBox(tabX,          tabY + tabH - 2, tabW, 2,  80, 80, 255, 255)
+        drawBox(tabX,          tabY,          2, tabH,    80, 80, 255, 255)
+        drawBox(tabX + tabW - 2, tabY,        2, tabH,   80, 80, 255, 255)
+
+        -- Barra título
+        drawBox(tabX, tabY, tabW, 36, 25, 25, 40, 255)
+        drawText("AIMBOT", tabX + tabW / 2, tabY + 10, 0.35, 120, 120, 255, 255, true)
+        drawText("F11", tabX + tabW - 32, tabY + 10, 0.28, 100, 100, 160, 255, false)
+
+        -- Status
+        local sR, sG, sB = enabled and 80 or 255, enabled and 255 or 80, enabled and 120 or 80
+        local sText = enabled and "● ACTIVADO" or "● DESACTIVADO"
+        drawText(sText, tabX + 12, tabY + 46, 0.30, sR, sG, sB, 255, false)
+
+        -- ── FOV SLIDER ──
+        drawText("FOV: " .. math.floor(FOV), tabX + 12, tabY + 80, 0.28, 180, 180, 180, 255, false)
+
+        local slX = tabX + 12
+        local slY = tabY + 106
+        local slW = tabW - 24
+        local slH = 8
+
+        -- Track
+        drawBox(slX, slY, slW, slH, 40, 40, 60, 255)
+
+        -- Fill
+        local fillRatio = (FOV - FOV_MIN) / (FOV_MAX - FOV_MIN)
+        drawBox(slX, slY, math.floor(slW * fillRatio), slH, 80, 80, 255, 255)
+
+        -- Knob
+        local knobX = slX + math.floor(slW * fillRatio) - 8
+        local knobY = slY - 5
+        drawBox(knobX, knobY, 16, 18, 130, 130, 255, 255)
+
+        -- Slider drag logic
+        if sliderDragging then
+            if IsControlPressed(0, 237) then
+                local mx = GetControlNormal(0, 239) * screenW
+                local ratio = math.max(0.0, math.min(1.0, (mx - slX) / slW))
+                FOV = FOV_MIN + ratio * (FOV_MAX - FOV_MIN)
+            else
+                sliderDragging = false
+            end
+        end
+
+        -- ── BOTONES FOV ──
+        local btnY = tabY + 128
+        local btnW = 36
+        local btnH = 28
+
+        -- Botón -
+        local minusHov = isHovered(tabX + 12, btnY, btnW, btnH)
+        drawBox(tabX + 12, btnY, btnW, btnH, minusHov and 60 or 35, 35, minusHov and 80 or 55, 255)
+        drawText("-", tabX + 12 + btnW / 2, btnY + 6, 0.45, 255, 255, 255, 255, true)
+
+        -- Valor centro
+        drawText(string.format("%.1f", FOV), tabX + tabW / 2, btnY + 7, 0.30, 220, 220, 220, 255, true)
+
+        -- Botón +
+        local plusHov = isHovered(tabX + tabW - 12 - btnW, btnY, btnW, btnH)
+        drawBox(tabX + tabW - 12 - btnW, btnY, btnW, btnH, plusHov and 60 or 35, 35, plusHov and 80 or 55, 255)
+        drawText("+", tabX + tabW - 12 - btnW / 2, btnY + 6, 0.45, 255, 255, 255, 255, true)
+
+        -- ── SMOOTHING LABEL ──
+        drawText("Smooth: " .. string.format("%.2f", SMOOTHING), tabX + 12, tabY + 170, 0.27, 140, 140, 180, 255, false)
+
+        -- Botones smoothing
+        local smY = tabY + 188
+        local smMHov = isHovered(tabX + 12, smY, btnW, btnH)
+        drawBox(tabX + 12, smY, btnW, btnH, smMHov and 60 or 35, 35, smMHov and 80 or 55, 255)
+        drawText("-", tabX + 12 + btnW / 2, smY + 6, 0.45, 255, 255, 255, 255, true)
+
+        drawText(string.format("%.2f", SMOOTHING), tabX + tabW / 2, smY + 7, 0.28, 220, 220, 220, 255, true)
+
+        local smPHov = isHovered(tabX + tabW - 12 - btnW, smY, btnW, btnH)
+        drawBox(tabX + tabW - 12 - btnW, smY, btnW, btnH, smPHov and 60 or 35, 35, smPHov and 80 or 55, 255)
+        drawText("+", tabX + tabW - 12 - btnW / 2, smY + 6, 0.45, 255, 255, 255, 255, true)
+
+        -- ── TOGGLE BUTTON ──
+        local tBtnY = tabY + 224
+        local tBtnHov = isHovered(tabX + 12, tBtnY, tabW - 24, 28)
+        local tR = enabled and 180 or 30
+        local tG = enabled and 50  or 180
+        local tB2 = enabled and 50  or 80
+        if tBtnHov then tR = tR + 20 end
+        drawBox(tabX + 12, tBtnY, tabW - 24, 28, tR, tG, tB2, 255)
+        local tText = enabled and "DESACTIVAR [F6]" or "ACTIVAR [F6]"
+        drawText(tText, tabX + tabW / 2, tBtnY + 7, 0.28, 255, 255, 255, 255, true)
+
+        ::skipDraw::
+    end
+end)
+
+-- ══════════════════════════════════
+--         INPUT LOOP
+-- ══════════════════════════════════
+
+Citizen.CreateThread(function()
+    while true do
+        Citizen.Wait(0)
+
+        -- F11 abre/cierra GUI
+        if IsControlJustPressed(0, 194) then -- 194 = F11
+            guiOpen = not guiOpen
+        end
+
+        -- F6 toggle aimbot
+        if IsControlJustPressed(0, 246) then
+            enabled = not enabled
+        end
+
+        if not guiOpen then goto skipInput end
+
+        local mx = GetControlNormal(0, 239) * screenW
+        local my = GetControlNormal(0, 240) * screenH
+        local clicked = IsControlJustPressed(0, 237)
+        local held    = IsControlPressed(0, 237)
+
+        -- Drag tablet desde título
+        if held then
+            if not dragging and not sliderDragging then
+                if mx >= tabX and mx <= tabX + tabW and my >= tabY and my <= tabY + 36 then
+                    dragging = true
+                    dragOffX = mx - tabX
+                    dragOffY = my - tabY
+                end
+            end
+        else
+            dragging = false
+        end
+
+        -- Slider click
+        local slX = tabX + 12
+        local slY = tabY + 106
+        local slW = tabW - 24
+        if clicked and mx >= slX and mx <= slX + slW and my >= slY - 5 and my <= slY + 18 then
+            sliderDragging = true
+        end
+
+        -- Botón FOV -
+        if clicked and isHovered(tabX + 12, tabY + 128, 36, 28) then
+            FOV = math.max(FOV_MIN, FOV - 1.0)
+        end
+        -- Botón FOV +
+        if clicked and isHovered(tabX + tabW - 48, tabY + 128, 36, 28) then
+            FOV = math.min(FOV_MAX, FOV + 1.0)
+        end
+
+        -- Botón Smooth -
+        if clicked and isHovered(tabX + 12, tabY + 188, 36, 28) then
+            SMOOTHING = math.max(0.01, math.floor((SMOOTHING - 0.01) * 100 + 0.5) / 100)
+        end
+        -- Botón Smooth +
+        if clicked and isHovered(tabX + tabW - 48, tabY + 188, 36, 28) then
+            SMOOTHING = math.min(1.0, math.floor((SMOOTHING + 0.01) * 100 + 0.5) / 100)
+        end
+
+        -- Toggle button
+        if clicked and isHovered(tabX + 12, tabY + 224, tabW - 24, 28) then
+            enabled = not enabled
+        end
+
+        ::skipInput::
+    end
+end)
